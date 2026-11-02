@@ -1,0 +1,827 @@
+From 39d0da8737b39c6cf5ce4328398412d14ad09e12 Mon Sep 17 00:00:00 2001
+From: blueworkslabs <blueworkslabs@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:00:00 +0000
+Subject: [PATCH] MediaCodec: put MediaTek HEVC pre-keyframe pictures back in
+ order
+
+Unofficial workaround, not part of Kodi.
+
+OMX.MTK.VIDEO.DECODER.HEVC (seen on a Fire TV Stick 4K Max, 2nd gen)
+now and then emits the last pictures before a keyframe out of order: the
+picture with the highest pts first, with its own pts, then the earlier
+ones with invented, increasing pts (previous + ~16 ms). On screen the
+picture jumps ahead and back (A D B C E instead of A B C D E).
+
+CMediaCodecOutputReorder keeps a ledger of the pts queued to the decoder,
+holds the early picture, gives the late pictures with an invented label
+(12-20 ms steps, below the next queued picture) the missing pts in
+ascending order and hands the held picture over after them. Anything
+else is handed over in the decoder's order; a picture without pts, a
+drain or a pts-less input stops reordering until the next flush. A held
+picture is handed over after at most 250 ms or at end of stream, and
+dropped on flush.
+
+Enabled only for surface rendering, mime video/hevc and that decoder;
+Dolby Vision content is left alone.
+---
+ .../DVDCodecs/Video/CMakeLists.txt            |   6 +-
+ .../Video/DVDVideoCodecAndroidMediaCodec.cpp  | 205 ++++++++++++++-
+ .../Video/DVDVideoCodecAndroidMediaCodec.h    |  16 ++
+ .../Video/MediaCodecOutputReorder.cpp         | 245 ++++++++++++++++++
+ .../DVDCodecs/Video/MediaCodecOutputReorder.h | 172 ++++++++++++
+ 5 files changed, 633 insertions(+), 11 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+index 452ed87..a0f38bf 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+@@ -32,8 +32,10 @@ if(APPLE)
+ endif()
+ 
+ if(CORE_SYSTEM_NAME STREQUAL android)
+-  list(APPEND SOURCES DVDVideoCodecAndroidMediaCodec.cpp)
+-  list(APPEND HEADERS DVDVideoCodecAndroidMediaCodec.h)
++  list(APPEND SOURCES DVDVideoCodecAndroidMediaCodec.cpp
++                      MediaCodecOutputReorder.cpp)
++  list(APPEND HEADERS DVDVideoCodecAndroidMediaCodec.h
++                      MediaCodecOutputReorder.h)
+ endif()
+ 
+ if("gbm" IN_LIST CORE_PLATFORM_NAME_LC OR "wayland" IN_LIST CORE_PLATFORM_NAME_LC)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
+index 6a542a5..afb9dc3 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
+@@ -40,6 +40,7 @@
+ 
+ #include <array>
+ #include <cassert>
++#include <chrono>
+ #include <memory>
+ #include <mutex>
+ #include <utility>
+@@ -72,6 +73,16 @@ enum MEDIACODEC_STATES
+   MEDIACODEC_STATE_STOPPED
+ };
+ 
++namespace
++{
++int64_t NowMs()
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++} // namespace
++
+ /*****************************************************************************/
+ /*****************************************************************************/
+ class CDVDMediaCodecOnFrameAvailable : public CEvent,
+@@ -921,6 +932,21 @@ bool CDVDVideoCodecAndroidMediaCodec::Open(CDVDStreamInfo &hints, CDVDCodecOptio
+   else
+     m_invalidPTSValue = 0;
+ 
++  // m_formatname carries the "(S)" suffix by now, so look at the mime type
++  m_outputReorder.reset();
++  if (m_render_surface && m_mime == "video/hevc" &&
++      StringUtils::StartsWith(m_codecname, "OMX.MTK.VIDEO.DECODER.HEVC"))
++  {
++    if (m_hints.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
++      CLog::Log(LOGINFO, "CDVDVideoCodecAndroidMediaCodec::Open keyframe output reorder off for "
++                         "Dolby Vision");
++    else
++    {
++      m_outputReorder = std::make_unique<CMediaCodecOutputReorder>();
++      CLog::Log(LOGINFO, "CDVDVideoCodecAndroidMediaCodec::Open keyframe output reorder enabled");
++    }
++  }
++
+   CLog::Log(LOGINFO, "CDVDVideoCodecAndroidMediaCodec::Open Using codec: {}", m_codecname);
+ 
+   m_opened = true;
+@@ -965,6 +991,8 @@ void CDVDVideoCodecAndroidMediaCodec::Dispose()
+ 
+   CLog::Log(LOGDEBUG, "CDVDVideoCodecAndroidMediaCodec::{}", __func__);
+ 
++  DiscardReorderPicture();
++
+   // invalidate any inflight outputbuffers
+   FlushInternal();
+ 
+@@ -1179,6 +1207,13 @@ bool CDVDVideoCodecAndroidMediaCodec::AddData(const DemuxPacket &packet)
+         xbmc_jnienv()->ExceptionClear();
+         CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec::AddData error");
+       }
++      else if (m_outputReorder)
++      {
++        if (pts != DVD_NOPTS_VALUE)
++          m_outputReorder->AddInput(presentationTimeUs);
++        else
++          m_outputReorder->Disable();
++      }
+       m_indexInputBuffer = -1;
+     }
+     else
+@@ -1194,6 +1229,9 @@ void CDVDVideoCodecAndroidMediaCodec::Reset()
+ 
+   if (m_codec)
+   {
++    // a held picture's output buffer must go back before the flush invalidates its index
++    DiscardReorderPicture();
++
+     // now we can flush the actual MediaCodec object
+     CLog::Log(LOGDEBUG, "CDVDVideoCodecAndroidMediaCodec::Reset Current state ({})", m_state);
+     m_codec->flush();
+@@ -1259,6 +1297,13 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::GetPicture(VideoPictur
+   if (!m_opened)
+     return VC_NONE;
+ 
++  // a picture put back in order waits for its turn
++  if (m_reorderPictureReady)
++    return HandOverReorderPicture(pVideoPicture);
++
++  if (m_outputReorder && ApplyReorder(m_outputReorder->Expire(NowMs()), pVideoPicture, false))
++    return VC_PICTURE;
++
+   if (m_state == MEDIACODEC_STATE_ERROR || m_state == MEDIACODEC_STATE_ENDOFSTREAM)
+     return VC_EOF;
+ 
+@@ -1270,24 +1315,33 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::GetPicture(VideoPictur
+ 
+     if (retgp > 0)
+     {
++      // GetOutputPicture() released the caller's previous buffer
+       pVideoPicture->videoBuffer = nullptr;
+-      pVideoPicture->SetParams(m_videobuffer);
+-      pVideoPicture->videoBuffer = m_videobuffer.videoBuffer;
+-
+-      CLog::Log(LOGDEBUG, LOGVIDEO,
+-                "CDVDVideoCodecAndroidMediaCodec::GetPicture index: {}, pts:{:0.4f}",
+-                static_cast<CMediaCodecVideoBuffer*>(m_videobuffer.videoBuffer)->GetBufferId(),
+-                pVideoPicture->pts);
+ 
+-      m_videobuffer.videoBuffer = nullptr;
++      if (!m_outputReorder)
++      {
++        HandOverPicture(pVideoPicture, m_videobuffer, m_outputPtsUs);
++        return VC_PICTURE;
++      }
+ 
+-      return VC_PICTURE;
++      const auto result = m_videobuffer.pts == DVD_NOPTS_VALUE
++                              ? m_outputReorder->AddUnlabelledOutput()
++                              : m_outputReorder->AddOutput(m_outputPtsUs, NowMs());
++      if (ApplyReorder(result, pVideoPicture, true))
++        return VC_PICTURE;
++      // held back: keep feeding the decoder
+     }
+     else
+     {
+       m_videobuffer.videoBuffer = nullptr;
+       if (retgp == -1 || m_state == MEDIACODEC_STATE_WAIT_ENDOFSTREAM) // EOS
+       {
++        // the held picture is the last one, hand it over before the end of stream
++        if (m_outputReorder && ApplyReorder(m_outputReorder->Flush(), pVideoPicture, false))
++        {
++          m_state = (retgp == -2) ? MEDIACODEC_STATE_ERROR : MEDIACODEC_STATE_ENDOFSTREAM;
++          return VC_PICTURE;
++        }
+         m_state = (retgp == -2) ? MEDIACODEC_STATE_ERROR : MEDIACODEC_STATE_ENDOFSTREAM;
+         CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecAndroidMediaCodec::GetPicture VC_EOF");
+         return VC_EOF;
+@@ -1321,6 +1375,10 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::GetPicture(VideoPictur
+   }
+   else if (m_state == MEDIACODEC_STATE_RUNNING)
+   {
++    // SignalEndOfStream() releases every output buffer we still own: hand the held picture over
++    // first, and hold nothing more until the next flush
++    if (m_outputReorder && ApplyReorder(m_outputReorder->Abandon(), pVideoPicture, false))
++      return VC_PICTURE;
+     SignalEndOfStream();
+     m_state = MEDIACODEC_STATE_WAIT_ENDOFSTREAM;
+   }
+@@ -1330,6 +1388,125 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::GetPicture(VideoPictur
+   return VC_NONE;
+ }
+ 
++CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::HandOverReorderPicture(
++    VideoPicture* pVideoPicture)
++{
++  // no new output buffer was dequeued, so the caller's previous buffer is still ours to release
++  if (pVideoPicture->videoBuffer)
++    pVideoPicture->videoBuffer->Release();
++  pVideoPicture->videoBuffer = nullptr;
++
++  pVideoPicture->SetParams(m_reorderPicture);
++  pVideoPicture->videoBuffer = m_reorderPicture.videoBuffer;
++  m_reorderPicture.videoBuffer = nullptr;
++  m_reorderPictureReady = false;
++
++  CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecAndroidMediaCodec::GetPicture index: {}, pts:{:0.4f}",
++            static_cast<CMediaCodecVideoBuffer*>(pVideoPicture->videoBuffer)->GetBufferId(),
++            pVideoPicture->pts);
++  return VC_PICTURE;
++}
++
++void CDVDVideoCodecAndroidMediaCodec::HandOverPicture(VideoPicture* pVideoPicture,
++                                                      VideoPicture& picture,
++                                                      int64_t ptsUs)
++{
++  // pVideoPicture->videoBuffer holds no reference here
++  pVideoPicture->videoBuffer = nullptr;
++  pVideoPicture->SetParams(picture);
++  if (m_outputReorder && picture.pts != DVD_NOPTS_VALUE)
++    pVideoPicture->pts = ptsUs + m_dtsShift;
++  pVideoPicture->videoBuffer = picture.videoBuffer;
++  picture.videoBuffer = nullptr;
++
++  CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecAndroidMediaCodec::GetPicture index: {}, pts:{:0.4f}",
++            static_cast<CMediaCodecVideoBuffer*>(pVideoPicture->videoBuffer)->GetBufferId(),
++            pVideoPicture->pts);
++}
++
++bool CDVDVideoCodecAndroidMediaCodec::ApplyReorder(const CMediaCodecOutputReorder::Result& result,
++                                                   VideoPicture* pVideoPicture,
++                                                   bool dequeued)
++{
++  using Source = CMediaCodecOutputReorder::Source;
++  LogReorder(result);
++  return CMediaCodecOutputReorder::Apply(
++      result, m_outputPtsUs,
++      [&](Source source, int64_t ptsUs)
++      {
++        // without a new output buffer the caller's previous buffer is still ours to release;
++        // GetOutputPicture() released it otherwise
++        if (!dequeued && pVideoPicture->videoBuffer)
++          pVideoPicture->videoBuffer->Release();
++        HandOverPicture(pVideoPicture, source == Source::CURRENT ? m_videobuffer : m_reorderPicture,
++                        ptsUs);
++      },
++      [&](Source source, int64_t ptsUs, bool ready)
++      {
++        KeepReorderPicture(source == Source::CURRENT ? m_videobuffer : m_reorderPicture, ptsUs);
++        m_reorderPictureReady = ready;
++      });
++}
++
++void CDVDVideoCodecAndroidMediaCodec::KeepReorderPicture(VideoPicture& picture, int64_t ptsUs)
++{
++  if (&picture != &m_reorderPicture)
++  {
++    if (m_reorderPicture.videoBuffer)
++      CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec::{}: slot busy, dropping its picture",
++                __func__);
++    m_reorderPicture.SetParams(picture); // releases a leftover buffer
++    m_reorderPicture.videoBuffer = picture.videoBuffer;
++    picture.videoBuffer = nullptr;
++  }
++  if (m_reorderPicture.pts != DVD_NOPTS_VALUE)
++    m_reorderPicture.pts = ptsUs + m_dtsShift;
++  m_reorderPictureReady = true;
++}
++
++void CDVDVideoCodecAndroidMediaCodec::DiscardReorderPicture()
++{
++  // back to MediaCodec without rendering
++  if (m_reorderPicture.videoBuffer)
++    m_reorderPicture.videoBuffer->Release();
++  m_reorderPicture.videoBuffer = nullptr;
++  m_reorderPictureReady = false;
++
++  if (m_outputReorder)
++    m_outputReorder->Reset();
++}
++
++void CDVDVideoCodecAndroidMediaCodec::LogReorder(const CMediaCodecOutputReorder::Result& result)
++{
++  using Event = CMediaCodecOutputReorder::Event;
++  switch (result.event)
++  {
++    case Event::HOLD:
++      CLog::Log(LOGDEBUG,
++                "CDVDVideoCodecAndroidMediaCodec: holding pts:{:0.4f} until earlier pictures arrive",
++                m_outputReorder->GetHeldPts() + m_dtsShift);
++      break;
++    case Event::RESTORED:
++      CLog::Log(LOGDEBUG, "CDVDVideoCodecAndroidMediaCodec: late picture pts:{:0.4f} -> {:0.4f}",
++                m_outputPtsUs + m_dtsShift, result.emit[0].pts + m_dtsShift);
++      break;
++    case Event::COMPLETE:
++      CLog::Log(LOGINFO,
++                "CDVDVideoCodecAndroidMediaCodec: put late pictures back before pts:{:0.4f}",
++                result.emit[result.count - 1].pts + m_dtsShift);
++      break;
++    case Event::GAVE_UP:
++    case Event::EXPIRED:
++      CLog::Log(LOGINFO,
++                "CDVDVideoCodecAndroidMediaCodec: handing over held pts:{:0.4f} unchanged ({})",
++                m_outputReorder->GetHeldPts() + m_dtsShift,
++                result.event == Event::EXPIRED ? "waited too long" : "pattern not complete");
++      break;
++    case Event::NONE:
++      break;
++  }
++}
++
+ void CDVDVideoCodecAndroidMediaCodec::SetCodecControl(int flags)
+ {
+   if (m_codecControlFlags != flags)
+@@ -1642,6 +1819,7 @@ int CDVDVideoCodecAndroidMediaCodec::GetOutputPicture(void)
+   if (index >= 0)
+   {
+     int64_t pts = bufferInfo.presentationTimeUs();
++    m_outputPtsUs = pts;
+     m_videobuffer.dts = DVD_NOPTS_VALUE;
+     m_videobuffer.pts = DVD_NOPTS_VALUE;
+     if (pts != AV_NOPTS_VALUE)
+@@ -1664,6 +1842,15 @@ int CDVDVideoCodecAndroidMediaCodec::GetOutputPicture(void)
+             LOGERROR,
+             "CDVDVideoCodecAndroidMediaCodec::GetOutputPicture: releaseOutputBuffer (drop) failed");
+       }
++      if (m_outputReorder)
++      {
++        // only the held picture can come back here; it goes out on the next GetPicture()
++        const auto result = (pts != AV_NOPTS_VALUE) ? m_outputReorder->DropOutput(pts)
++                                                    : m_outputReorder->Abandon();
++        LogReorder(result);
++        if (result.count > 0)
++          KeepReorderPicture(m_reorderPicture, result.emit[0].pts);
++      }
+       return -2;
+     }
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h
+index a672b8c..8e660f7 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h
+@@ -10,6 +10,7 @@
+ 
+ #include "DVDStreamInfo.h"
+ #include "DVDVideoCodec.h"
++#include "MediaCodecOutputReorder.h"
+ #include "cores/VideoPlayer/Buffers/VideoBuffer.h"
+ #include "threads/SingleLock.h"
+ #include "threads/Thread.h"
+@@ -142,6 +143,14 @@ protected:
+   int GetOutputPicture(void);
+   void ConfigureOutputFormat(CJNIMediaFormat& mediaformat);
+   void UpdateFpsDuration();
++  VCReturn HandOverReorderPicture(VideoPicture* pVideoPicture);
++  bool ApplyReorder(const CMediaCodecOutputReorder::Result& result,
++                    VideoPicture* pVideoPicture,
++                    bool dequeued);
++  void HandOverPicture(VideoPicture* pVideoPicture, VideoPicture& picture, int64_t ptsUs);
++  void KeepReorderPicture(VideoPicture& picture, int64_t ptsUs);
++  void DiscardReorderPicture();
++  void LogReorder(const CMediaCodecOutputReorder::Result& result);
+ 
+   // surface handling functions
+   static void CallbackInitSurfaceTexture(void*);
+@@ -177,6 +186,13 @@ protected:
+ 
+   std::unique_ptr<CBitstreamConverter> m_bitstream;
+   VideoPicture m_videobuffer;
++  int64_t m_outputPtsUs = 0; // pts of the last dequeued output buffer, decoder timebase
++
++  // Puts back in order the pictures some MediaTek HEVC decoders emit out of order before a
++  // keyframe, see CMediaCodecOutputReorder. Only set for those decoders.
++  std::unique_ptr<CMediaCodecOutputReorder> m_outputReorder;
++  VideoPicture m_reorderPicture; // held back, or waiting for its turn when m_reorderPictureReady
++  bool m_reorderPictureReady = false;
+ 
+   int m_indexInputBuffer;
+   bool m_render_surface;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.cpp
+new file mode 100644
+index 0000000..174763d
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.cpp
+@@ -0,0 +1,245 @@
++/*
++ *  Copyright (C) 2026 kodi-mtk-hevc-workaround contributors
++ *  Unofficial addition to Kodi - https://kodi.tv - not part of Kodi and not endorsed by Team Kodi
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "MediaCodecOutputReorder.h"
++
++#include <algorithm>
++
++bool CMediaCodecOutputReorder::Reset()
++{
++  const bool wasHolding = m_holding;
++  m_ledger.clear();
++  m_disabled = false;
++  m_hasLastOut = false;
++  m_lastOut = 0;
++  m_holding = false;
++  m_heldPts = 0;
++  m_heldSinceMs = 0;
++  m_lastLabel = 0;
++  m_missing.clear();
++  return wasHolding;
++}
++
++void CMediaCodecOutputReorder::AddInput(int64_t pts)
++{
++  if (m_disabled)
++    return;
++
++  // the same pts twice makes the ledger ambiguous
++  if (std::find(m_ledger.begin(), m_ledger.end(), pts) != m_ledger.end())
++  {
++    Disable();
++    return;
++  }
++
++  m_ledger.push_back(pts);
++  if (m_ledger.size() > MAX_LEDGER)
++    m_ledger.pop_front();
++}
++
++void CMediaCodecOutputReorder::Disable()
++{
++  m_disabled = true;
++  m_ledger.clear();
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::AddOutput(int64_t pts, int64_t nowMs)
++{
++  Result result;
++  const bool known = !m_disabled && TakeInput(pts);
++
++  if (m_holding)
++  {
++    if (!m_disabled)
++    {
++      if (!known && IsInventedLabel(pts))
++      {
++        // a late picture with an invented pts: it is the earliest picture still missing
++        m_lastLabel = pts;
++        const int64_t restored = m_missing.front();
++        m_missing.pop_front();
++        TakeInput(restored);
++        result.Add(Source::CURRENT, restored);
++        result.event = Event::RESTORED;
++        Handed(restored);
++        if (m_missing.empty())
++          ReleaseHeld(result, Event::COMPLETE);
++        return result;
++      }
++
++      const auto missing = std::find(m_missing.begin(), m_missing.end(), pts);
++      if (known && missing != m_missing.end())
++      {
++        // a late picture that kept its own pts
++        m_missing.erase(missing);
++        result.Add(Source::CURRENT, pts);
++        result.event = Event::RESTORED;
++        Handed(pts);
++        if (m_missing.empty())
++          ReleaseHeld(result, Event::COMPLETE);
++        return result;
++      }
++    }
++
++    // not the pattern: hand over what we have in the order the decoder gave it
++    ReleaseHeld(result, Event::GAVE_UP);
++    result.Add(Source::CURRENT, pts);
++    Handed(pts);
++    return result;
++  }
++
++  if (known && m_hasLastOut)
++  {
++    // queued pictures that belong between the last picture and this one but have not come out:
++    // a decoder outputs in presentation order, so they can only be late
++    std::deque<int64_t> missing;
++    for (const int64_t queued : m_ledger)
++    {
++      if (queued > m_lastOut && queued < pts)
++        missing.push_back(queued);
++    }
++
++    if (!missing.empty() && missing.size() <= MAX_MISSING && pts - m_lastOut <= MAX_GAP_US)
++    {
++      std::sort(missing.begin(), missing.end());
++      m_missing = std::move(missing);
++      m_holding = true;
++      m_heldPts = pts;
++      m_lastLabel = pts;
++      m_heldSinceMs = nowMs;
++      result.holdCurrent = true;
++      result.event = Event::HOLD;
++      return result;
++    }
++  }
++
++  result.Add(Source::CURRENT, pts);
++  Handed(pts);
++  return result;
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::DropOutput(int64_t pts)
++{
++  Result result;
++  const bool known = !m_disabled && TakeInput(pts);
++
++  if (m_holding)
++  {
++    const auto missing = std::find(m_missing.begin(), m_missing.end(), pts);
++    if (!m_disabled && !known && IsInventedLabel(pts))
++    {
++      // a late picture with an invented pts, dropped: its missing pts is gone
++      m_lastLabel = pts;
++      const int64_t lost = m_missing.front();
++      m_missing.pop_front();
++      TakeInput(lost);
++      Handed(lost);
++    }
++    else if (known && missing != m_missing.end())
++    {
++      m_missing.erase(missing);
++      Handed(pts);
++    }
++    else
++    {
++      ReleaseHeld(result, Event::GAVE_UP);
++      Handed(pts);
++      return result;
++    }
++
++    if (m_missing.empty())
++      ReleaseHeld(result, Event::COMPLETE);
++    return result;
++  }
++
++  Handed(pts);
++  return result;
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::AddUnlabelledOutput()
++{
++  Result result = Abandon();
++  result.Add(Source::CURRENT, 0);
++  return result;
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::Abandon()
++{
++  Result result;
++  if (m_holding)
++    ReleaseHeld(result, Event::GAVE_UP);
++  Disable();
++  return result;
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::Expire(int64_t nowMs)
++{
++  Result result;
++  if (m_holding && nowMs - m_heldSinceMs > MAX_HOLD_MS)
++    ReleaseHeld(result, Event::EXPIRED);
++  return result;
++}
++
++CMediaCodecOutputReorder::Result CMediaCodecOutputReorder::Flush()
++{
++  Result result;
++  if (m_holding)
++    ReleaseHeld(result, Event::GAVE_UP);
++  return result;
++}
++
++bool CMediaCodecOutputReorder::IsInventedLabel(int64_t pts) const
++{
++  // the decoder labels each late picture with its previous label + ~16 ms, below the next real
++  // picture after the held one; anything else is not a late picture
++  const int64_t step = pts - m_lastLabel;
++  if (m_missing.empty() || step < MIN_STEP_US || step > MAX_STEP_US)
++    return false;
++
++  return std::none_of(m_ledger.begin(), m_ledger.end(), [this, pts](int64_t queued) {
++    return queued > m_heldPts && queued <= pts;
++  });
++}
++
++bool CMediaCodecOutputReorder::TakeInput(int64_t pts)
++{
++  // some decoders report a queued pts a microsecond off
++  const auto it = std::find_if(m_ledger.begin(), m_ledger.end(), [pts](int64_t queued) {
++    return queued >= pts - PTS_TOLERANCE_US && queued <= pts + PTS_TOLERANCE_US;
++  });
++  if (it == m_ledger.end())
++    return false;
++
++  m_ledger.erase(it);
++  return true;
++}
++
++void CMediaCodecOutputReorder::ReleaseHeld(Result& result, Event event)
++{
++  result.Add(Source::HELD, m_heldPts);
++  result.event = event;
++
++  // whatever is still missing will not be shown in order any more
++  for (const int64_t pts : m_missing)
++    TakeInput(pts);
++  m_missing.clear();
++  m_holding = false;
++  Handed(m_heldPts);
++}
++
++void CMediaCodecOutputReorder::Handed(int64_t pts)
++{
++  if (!m_hasLastOut || pts > m_lastOut)
++    m_lastOut = pts;
++  m_hasLastOut = true;
++
++  // pts at or before the last handed-out picture can no longer be put in order
++  m_ledger.erase(std::remove_if(m_ledger.begin(), m_ledger.end(),
++                                [this](int64_t queued) { return queued <= m_lastOut; }),
++                 m_ledger.end());
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.h
+new file mode 100644
+index 0000000..8485433
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MediaCodecOutputReorder.h
+@@ -0,0 +1,172 @@
++/*
++ *  Copyright (C) 2026 kodi-mtk-hevc-workaround contributors
++ *  Unofficial addition to Kodi - https://kodi.tv - not part of Kodi and not endorsed by Team Kodi
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++
++/*!
++ * \brief Puts back in order the pictures some MediaTek HEVC decoders emit out of order before a
++ * keyframe.
++ *
++ * Seen with OMX.MTK.VIDEO.DECODER.HEVC on a Fire TV Stick 4K Max (2nd gen): now and then the last
++ * pictures before a keyframe leave the decoder out of order. The picture with the highest pts comes
++ * first and keeps its own pts. The earlier pictures follow, but with invented, increasing pts
++ * (previous + ~16 ms) instead of their own. Their real pts never come back.
++ *
++ * The class keeps a ledger of the pts queued to the decoder. A decoder outputs in presentation
++ * order, so when a picture arrives shortly after the last handed-out one while queued pictures that
++ * belong between them are still missing, those are late: it holds that picture. A following picture
++ * is taken as late only if it carries the invented label: never queued, 12-20 ms above the previous
++ * label, and below the next real picture. Late pictures get the missing pts in ascending order,
++ * which assumes the decoder emits them in that order (as in every captured case); then the held
++ * picture follows them. Only one early picture ahead of up to MAX_MISSING late ones can be put
++ * right. When the next picture does not fit, the held picture is handed over first, then that
++ * picture unchanged, i.e. in the decoder's order. A picture without pts, a drain or a pts-less input
++ * stops all reordering until the next Reset(). A held picture is never kept longer than
++ * MAX_HOLD_MS.
++ *
++ * All pts are in the decoder's microsecond timebase (MediaCodec presentationTimeUs).
++ */
++class CMediaCodecOutputReorder
++{
++public:
++  enum class Source
++  {
++    CURRENT, //!< the picture just taken from the decoder
++    HELD, //!< the picture held back earlier
++  };
++
++  struct Emit
++  {
++    Source source;
++    int64_t pts;
++  };
++
++  enum class Event
++  {
++    NONE,
++    HOLD, //!< the current picture is held back
++    RESTORED, //!< a late picture got its missing pts back
++    COMPLETE, //!< all missing pictures arrived, the held picture follows them
++    GAVE_UP, //!< the pattern did not continue, the held picture is handed over as is
++    EXPIRED, //!< the held picture waited too long
++  };
++
++  struct Result
++  {
++    Emit emit[2]; //!< hand over in this order
++    int count = 0;
++    bool holdCurrent = false; //!< keep the current picture, it is the held one now
++    Event event = Event::NONE;
++
++    void Add(Source source, int64_t pts) { emit[count++] = {source, pts}; }
++  };
++
++  //! Most pictures the decoder may still owe before the held one.
++  static constexpr size_t MAX_MISSING = 3;
++  //! Longest a picture is held, in milliseconds.
++  static constexpr int64_t MAX_HOLD_MS = 250;
++  //! Most queued pts remembered.
++  static constexpr size_t MAX_LEDGER = 64;
++  //! A reported pts this close to a queued one is that picture (decoder rounding).
++  static constexpr int64_t PTS_TOLERANCE_US = 2;
++  //! Invented labels step this much above the previous label (seen: 16 ms). Anything closer may be
++  //! the same picture again, anything further another picture.
++  static constexpr int64_t MIN_STEP_US = 12000;
++  static constexpr int64_t MAX_STEP_US = 20000;
++  //! Largest distance from the last handed-out picture to a picture worth holding (seen: 125 ms).
++  static constexpr int64_t MAX_GAP_US = 200000;
++
++  /*!
++   * \brief Forget everything, e.g. after a flush.
++   * \return true if a picture was held; the caller must discard it without showing it.
++   */
++  bool Reset();
++
++  //! A picture with this pts was queued to the decoder.
++  void AddInput(int64_t pts);
++
++  //! A picture was queued without pts. The pattern cannot be told apart then, pass everything on.
++  void Disable();
++
++  /*!
++   * \brief A picture came out of the decoder.
++   * \param pts the pts the decoder reported
++   * \param nowMs a monotonic clock in milliseconds
++   */
++  Result AddOutput(int64_t pts, int64_t nowMs);
++
++  //! A picture came out of the decoder and was dropped without being shown.
++  Result DropOutput(int64_t pts);
++
++  /*!
++   * \brief A picture without pts came out of the decoder. It cannot be placed: the held picture goes
++   * first, then this one, and nothing more is reordered until Reset().
++   */
++  Result AddUnlabelledOutput();
++
++  /*!
++   * \brief Hand over the held picture and pass everything on unchanged until Reset(), e.g. before
++   * the decoder is drained or after a picture without pts was dropped.
++   */
++  Result Abandon();
++
++  //! Hand over the held picture if it has waited too long.
++  Result Expire(int64_t nowMs);
++
++  //! No more pictures will come (end of stream): hand over the held picture.
++  Result Flush();
++
++  /*!
++   * \brief Carry out a result: hand over its first picture now, keep the other one.
++   * \param currentPts pts of the current picture, used when it is held
++   * \param handOver handOver(source, pts) hands that picture over now
++   * \param keep keep(source, pts, ready) puts that picture in the codec's single slot; ready means
++   *             it is handed over on the next call, otherwise it is the held picture
++   * \return true if a picture was handed over
++   */
++  template<typename HandOver, typename Keep>
++  static bool Apply(const Result& result, int64_t currentPts, HandOver&& handOver, Keep&& keep)
++  {
++    if (result.holdCurrent)
++    {
++      keep(Source::CURRENT, currentPts, false);
++      return false;
++    }
++    if (result.count == 0)
++      return false;
++    handOver(result.emit[0].source, result.emit[0].pts);
++    if (result.count > 1)
++      keep(result.emit[1].source, result.emit[1].pts, true);
++    return true;
++  }
++
++  bool IsHolding() const { return m_holding; }
++  int64_t GetHeldPts() const { return m_heldPts; }
++
++private:
++  bool IsInventedLabel(int64_t pts) const;
++  bool TakeInput(int64_t pts);
++  void ReleaseHeld(Result& result, Event event);
++  void Handed(int64_t pts);
++
++  std::deque<int64_t> m_ledger; // queued pts not seen at the output yet, in queue order
++  bool m_disabled = false;
++
++  bool m_hasLastOut = false;
++  int64_t m_lastOut = 0;
++
++  bool m_holding = false;
++  int64_t m_heldPts = 0;
++  int64_t m_heldSinceMs = 0;
++  int64_t m_lastLabel = 0; // decoder label of the held picture, then of the last late picture
++  std::deque<int64_t> m_missing; // ascending
++};
+-- 
+2.43.0
+
