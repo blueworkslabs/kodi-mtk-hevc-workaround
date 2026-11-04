@@ -1,6 +1,6 @@
 # Notices
 
-- **Kodi** — Copyright (C) 2005-2025 Team Kodi, https://kodi.tv. Licensed under GPL-2.0-or-later. The patch in `patches/` modifies Kodi 21.3-Omega source files and is a derivative work of Kodi.
+- **Kodi** — Copyright (C) 2005-2025 Team Kodi, https://kodi.tv. Licensed under GPL-2.0-or-later. The patches in `patches/` and `experimental/` modify Kodi 21.3-Omega source files and are derivative works of Kodi.
 - **New source files in the patch** (`MediaCodecOutputReorder.h`, `MediaCodecOutputReorder.cpp`) were written for this project: Copyright (C) 2026 kodi-mtk-hevc-workaround contributors, `SPDX-License-Identifier: GPL-2.0-or-later`. They are not part of Kodi and Team Kodi has not reviewed or endorsed them. The Kodi files the patch modifies keep their existing upstream notices.
 - **Tests and tools** in `tests/` and `tools/` are part of this project and licensed under GPL-2.0-or-later.
 - **Fixtures** in `tests/fixtures/` hold decoder event timings captured on a Fire TV Stick 4K Max (2nd gen). They contain no video, audio or file names. Times are relative, and every timestamp is shifted per playback epoch.

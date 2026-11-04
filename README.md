@@ -33,7 +33,7 @@ The workaround switches on only for that decoder with Surface output and plain H
 | `tests/` | Unit and replay tests for the reorder logic: captured decoder sequences, hand-written lifecycle cases, and negative controls. |
 | `tools/extract_fixture.py` | Turns a Kodi debug log into a replay fixture. |
 | `docs/` | [How it works](docs/HOW-IT-WORKS.md), [building](docs/BUILD.md), [installing and rolling back](docs/INSTALL.md), [findings from comparing with ExoPlayer](docs/FINDINGS.md). |
-| `experimental/` | A measured experiment, not part of the workaround: polling the decoder without waiting halves how often the fault appears. See [experimental/README.md](experimental/README.md). |
+| `experimental/` | A measured experiment, not part of the workaround: polling the decoder without waiting reduced timestamp-anomaly event counts in one randomized comparison, but did not eliminate the fault. See [experimental/README.md](experimental/README.md). |
 
 ## Quick start (source)
 
@@ -69,7 +69,7 @@ There are no prebuilt APKs here. You build and sign your own.
 
 ## Why not prevent it instead?
 
-ExoPlayer plays the same file on the same decoder without the fault. We moved every codec-facing Kodi trait we could find into ExoPlayer and it stayed clean, so the cause is most likely timing inside the decoder, not a wrong setup in Kodi. One Kodi-side change halves the fault rate but does not remove it. Details: [docs/FINDINGS.md](docs/FINDINGS.md).
+Media3/ExoPlayer stayed timestamp-clean in our measured runs on the same file and decoder, including when we transplanted the specific Kodi traits listed in the report. Those traits did not reproduce the fault under the tested conditions; this does not rule out other configuration or timing interactions. Making Kodi's output check non-blocking reduced recorded anomaly events from 22 to 11 in one randomized comparison, but the fault remained in 6 of 8 modified runs. The mechanism is unresolved. Details: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## License
 
