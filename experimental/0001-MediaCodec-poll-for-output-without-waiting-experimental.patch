@@ -1,0 +1,39 @@
+From 61c625905883ab893ae5b6082f500fd76e440984 Mon Sep 17 00:00:00 2001
+From: blueworkslabs <blueworkslabs@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:52:31 +0000
+Subject: [PATCH] MediaCodec: poll for output without waiting (experimental)
+
+Unofficial experiment, not part of Kodi.
+
+GetOutputPicture() waited up to 10 ms in dequeueOutputBuffer() while
+running. Polling without waiting, as Media3 does in synchronous mode,
+lets Kodi keep the decoder fuller. On a Fire TV Stick 4K Max (2nd gen)
+with OMX.MTK.VIDEO.DECODER.HEVC, recorded timestamp-anomaly events
+fell from 22 to 11 in one randomised 16-pass comparison (exact one-sided
+p = 0.04012); 6 of 8 modified passes still showed the signature.
+Not tested together with the reorder workaround, on other decoders
+or for seek, pause and stop behaviour.
+The end-of-stream wait is unchanged.
+---
+ .../DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp       | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
+index 6a542a5..61f1071 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp
+@@ -1626,7 +1626,10 @@ bool CDVDVideoCodecAndroidMediaCodec::ConfigureMediaCodec(void)
+ int CDVDVideoCodecAndroidMediaCodec::GetOutputPicture(void)
+ {
+   int rtn = 0;
+-  int64_t timeout_us = (m_state == MEDIACODEC_STATE_WAIT_ENDOFSTREAM) ? 100000 : 10000;
++  // Experimental: poll for output without waiting while running (was 10 ms), as Media3 does in
++  // synchronous mode. One MTK HEVC comparison found fewer timestamp anomalies, not elimination;
++  // see docs/FINDINGS.md of kodi-mtk-hevc-workaround. Other decoders are untested.
++  int64_t timeout_us = (m_state == MEDIACODEC_STATE_WAIT_ENDOFSTREAM) ? 100000 : 0;
+   CJNIMediaCodecBufferInfo bufferInfo;
+ 
+   ssize_t index = m_codec->dequeueOutputBuffer(bufferInfo, timeout_us);
+-- 
+2.43.0
+
